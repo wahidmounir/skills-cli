@@ -1,0 +1,1314 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""skills-cli: Token-efficient dynamic skill discovery & on-demand context loading for AI agents.
+
+Modeled on mcp-cli to keep unnecessary skills out of model context windows.
+Version: 1.0.0
+"""
+
+from __future__ import annotations
+
+
+# --- BEGIN MODULE: parser.py ---
+
+"""Parser for SKILL.md frontmatter, markdown sections, and structure."""
+
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+try:
+    import yaml  # type: ignore
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+
+@dataclass
+class Section:
+    title: str
+    level: int
+    start_line: int
+    end_line: int
+    content: str = ""
+
+
+@dataclass
+class SkillMeta:
+    name: str
+    description: str = ""
+    version: str = ""
+    license: str = ""
+    allowed_tools: str = ""
+    user_invocable: bool = True
+    compatibility: str = ""
+    tags: list[str] = field(default_factory=list)
+    raw_frontmatter: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ParsedSkill:
+    path: Path
+    meta: SkillMeta
+    sections: list[Section]
+    full_text: str
+    word_count: int
+    token_estimate: int
+    mtime: float
+
+
+def estimate_tokens(text: str) -> int:
+    """Fast, accurate token estimation (~1.33 tokens per word or ~4 chars/token)."""
+    if not text:
+        return 0
+    words = len(text.split())
+    chars = len(text)
+    # Average of word-based and char-based heuristics
+    return max(1, int((words * 1.33 + chars / 4.0) / 2.0))
+
+
+def _parse_yaml_minimal(raw: str) -> dict[str, Any]:
+    """Lightweight zero-dependency YAML parser for standard frontmatter."""
+    result: dict[str, Any] = {}
+    lines = raw.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+
+        # Match key: value
+        m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
+        if not m:
+            i += 1
+            continue
+
+        key, val = m.group(1), m.group(2).strip()
+
+        # Folded or literal multiline block (> or |)
+        if val in (">", ">-", "|", "|-"):
+            block_lines = []
+            i += 1
+            indent = None
+            while i < len(lines):
+                subline = lines[i]
+                if not subline.strip():
+                    block_lines.append("")
+                    i += 1
+                    continue
+                current_indent = len(subline) - len(subline.lstrip())
+                if indent is None:
+                    if current_indent == 0:
+                        break
+                    indent = current_indent
+                elif current_indent < indent:
+                    break
+                block_lines.append(subline[indent:])
+                i += 1
+            join_char = " " if val.startswith(">") else "\n"
+            result[key] = join_char.join(l.strip() if val.startswith(">") else l for l in block_lines).strip()
+            continue
+
+        # Inline list [a, b, c]
+        if val.startswith("[") and val.endswith("]"):
+            items = [item.strip().strip("'\"") for item in val[1:-1].split(",") if item.strip()]
+            result[key] = items
+            i += 1
+            continue
+
+        # Multiline list (- item)
+        if not val and (i + 1 < len(lines)) and re.match(r"^\s*-\s+", lines[i + 1]):
+            items = []
+            i += 1
+            while i < len(lines) and re.match(r"^\s*-\s+(.*)$", lines[i]):
+                item_val = re.match(r"^\s*-\s+(.*)$", lines[i]).group(1).strip().strip("'\"")
+                items.append(item_val)
+                i += 1
+            result[key] = items
+            continue
+
+        # Primitive values
+        val_lower = val.lower()
+        if val_lower == "true":
+            result[key] = True
+        elif val_lower == "false":
+            result[key] = False
+        elif val.isdigit():
+            result[key] = int(val)
+        else:
+            # Strip outer quotes if present
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            result[key] = val
+
+        i += 1
+
+    return result
+
+
+def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
+    """Extract frontmatter and remaining body."""
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", content, re.DOTALL)
+    if not m:
+        return {}, content
+
+    header_raw, body = m.group(1), m.group(2)
+    if HAVE_YAML:
+        try:
+            data = yaml.safe_load(header_raw)
+            if isinstance(data, dict):
+                return data, body
+        except Exception:
+            pass
+
+    # Fallback to zero-dependency minimal parser
+    return _parse_yaml_minimal(header_raw), body
+
+
+def parse_sections(text: str) -> list[Section]:
+    """Parse markdown headings into structured Section objects with absolute line numbers."""
+    lines = text.splitlines()
+    sections: list[Section] = []
+    in_frontmatter = False
+    in_code_block = False
+    fm_delimiters = 0
+
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped == "---":
+            fm_delimiters += 1
+            in_frontmatter = (fm_delimiters < 2)
+            continue
+        if in_frontmatter:
+            continue
+
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading_match:
+            sections.append(
+                Section(
+                    title=heading_match.group(2).strip(),
+                    level=len(heading_match.group(1)),
+                    start_line=idx,
+                    end_line=idx,
+                )
+            )
+
+    return sections
+
+
+def parse_skill_file(path: Path) -> ParsedSkill:
+    """Parse a SKILL.md file completely into structured format."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    mtime = path.stat().st_mtime
+    frontmatter, body = parse_frontmatter(text)
+
+    # Derive name if missing
+    name = str(frontmatter.get("name", "")).strip()
+    if not name:
+        name = path.parent.name
+
+    desc = str(frontmatter.get("description", "")).strip()
+    if not desc and body:
+        # Fallback to first non-empty paragraph
+        for p in body.split("\n\n"):
+            clean = p.strip().lstrip("#").strip()
+            if clean:
+                desc = clean[:200]
+                break
+
+    # Extract tags from frontmatter or infer from description
+    tags: list[str] = []
+    raw_tags = frontmatter.get("tags")
+    if isinstance(raw_tags, list):
+        tags.extend(str(t) for t in raw_tags)
+    elif isinstance(raw_tags, str):
+        tags.extend(t.strip() for t in raw_tags.split(",") if t.strip())
+
+    sections = parse_sections(text)
+    word_count = len(text.split())
+    token_est = estimate_tokens(text)
+
+    metadata_obj = frontmatter.get("metadata")
+    version_val = frontmatter.get("version")
+    if not version_val and isinstance(metadata_obj, dict):
+        version_val = metadata_obj.get("version")
+
+    meta = SkillMeta(
+        name=name,
+        description=desc,
+        version=str(version_val or ""),
+        license=str(frontmatter.get("license") or ""),
+        allowed_tools=str(frontmatter.get("allowed-tools") or ""),
+        user_invocable=bool(frontmatter.get("user-invocable", True)),
+        compatibility=str(frontmatter.get("compatibility") or ""),
+        tags=sorted(list(set(tags))),
+        raw_frontmatter=frontmatter if isinstance(frontmatter, dict) else {},
+    )
+
+    return ParsedSkill(
+        path=path.resolve(),
+        meta=meta,
+        sections=sections,
+        full_text=text,
+        word_count=word_count,
+        token_estimate=token_est,
+        mtime=mtime,
+    )
+
+
+def extract_section(parsed: ParsedSkill, query: str) -> Section | None:
+    """Extract a specific section by name, including its child subsections."""
+    q_clean = query.strip().lower()
+    target_sec = None
+    for sec in parsed.sections:
+        if sec.title.lower() == q_clean:
+            target_sec = sec
+            break
+    if not target_sec:
+        for sec in parsed.sections:
+            if q_clean in sec.title.lower():
+                target_sec = sec
+                break
+    if not target_sec:
+        return None
+
+    if parsed.full_text:
+        lines = parsed.full_text.splitlines()
+        start_idx = max(0, target_sec.start_line - 1)
+        end_idx = len(lines)
+        for other in parsed.sections:
+            if other.start_line > target_sec.start_line and other.level <= target_sec.level:
+                end_idx = other.start_line - 1
+                break
+        content = "\n".join(lines[start_idx:end_idx]).strip()
+        return Section(
+            title=target_sec.title,
+            level=target_sec.level,
+            start_line=target_sec.start_line,
+            end_line=end_idx,
+            content=content,
+        )
+
+    return target_sec
+
+# --- END MODULE: parser.py ---
+
+
+# --- BEGIN MODULE: discovery.py ---
+
+"""Discovery of skill roots and SKILL.md files across Antigravity, Claude, and Codex."""
+
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+SkillScope = Literal["workspace", "plugin", "global", "library", "builtin", "custom"]
+
+
+@dataclass
+class DiscoveredSkillRef:
+    name: str
+    path: Path
+    scope: SkillScope
+    plugin_name: str | None = None
+    priority: int = 0  # higher number = higher priority
+
+
+def get_default_roots(workspace_dir: Path | None = None) -> list[tuple[Path, SkillScope, int]]:
+    """Return all standard discovery roots with their scopes and precedence."""
+    home = Path.home()
+    roots: list[tuple[Path, SkillScope, int]] = []
+
+    # Priority 1: Workspace project (highest)
+    ws = (workspace_dir or Path.cwd()).resolve()
+    current = ws
+    while True:
+        # Check standard workspace subdirs
+        ws_candidates = [
+            (current / ".agents" / "skills", 100),
+            (current / ".gemini" / "skills", 95),
+            (current / ".claude" / "skills", 90),
+            (current / "skills", 85),
+        ]
+        for candidate, prio in ws_candidates:
+            if candidate.is_dir():
+                roots.append((candidate, "workspace", prio))
+
+        parent = current.parent
+        if parent == current:
+            break
+        # Stop at git root or filesystem root
+        if (current / ".git").exists():
+            break
+        current = parent
+
+    # Priority 2: Custom SKILLS_PATH environment variable
+    custom_env = os.environ.get("SKILLS_PATH")
+    if custom_env:
+        for p in custom_env.split(":"):
+            if p.strip() and Path(p.strip()).is_dir():
+                roots.append((Path(p.strip()), "custom", 80))
+
+    # Priority 3: Antigravity Plugins
+    plugins_dir = home / ".gemini" / "config" / "plugins"
+    if plugins_dir.is_dir():
+        for plugin_folder in plugins_dir.iterdir():
+            if plugin_folder.is_dir():
+                plugin_skills = plugin_folder / "skills"
+                if plugin_skills.is_dir():
+                    roots.append((plugin_skills, "plugin", 70))
+
+    # Priority 4: User Global Configurations (Tier A - active in prompt)
+    roots.append((home / ".gemini" / "config" / "skills", "global", 65))
+    roots.append((home / ".agents" / "skills", "global", 60))
+    roots.append((home / ".claude" / "skills", "global", 55))
+
+    # Priority 5: On-Demand Skills Library (Tier B - outside prompt auto-discovery)
+    roots.append((home / ".config" / "skills", "library", 50))
+
+    # Priority 6: Builtin Antigravity Skills
+    roots.append((home / ".gemini" / "antigravity" / "builtin" / "skills", "builtin", 40))
+
+    return roots
+
+
+def scan_skills(workspace_dir: Path | None = None) -> list[DiscoveredSkillRef]:
+    """Scan all roots and return discovered skills deduplicated by name."""
+    roots = get_default_roots(workspace_dir)
+    discovered: dict[str, DiscoveredSkillRef] = {}
+    seen_paths: set[Path] = set()
+
+    for root_dir, scope, prio in roots:
+        if not root_dir.exists():
+            continue
+
+        # Look for SKILL.md in direct subdirectories: root/<skill_name>/SKILL.md
+        # and also recursively
+        for skill_file in root_dir.glob("**/SKILL.md"):
+            resolved = skill_file.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+
+            # Skill name derived from folder name by default
+            skill_name = skill_file.parent.name
+            plugin_name = None
+            if scope == "plugin":
+                # Path: .../plugins/<plugin_name>/skills/<skill_name>/SKILL.md
+                try:
+                    rel = skill_file.relative_to(Path.home() / ".gemini" / "config" / "plugins")
+                    plugin_name = rel.parts[0]
+                except ValueError:
+                    plugin_name = None
+
+            ref = DiscoveredSkillRef(
+                name=skill_name,
+                path=resolved,
+                scope=scope,
+                plugin_name=plugin_name,
+                priority=prio,
+            )
+
+            # Deduplication: higher priority wins
+            if skill_name not in discovered or prio > discovered[skill_name].priority:
+                discovered[skill_name] = ref
+
+    return sorted(discovered.values(), key=lambda r: (r.name, -r.priority))
+
+# --- END MODULE: discovery.py ---
+
+
+# --- BEGIN MODULE: matcher.py ---
+
+"""Task-aware relevance matching and keyword search engine for skills-cli."""
+
+
+import math
+import re
+from dataclasses import dataclass
+from typing import Sequence
+
+
+STOPWORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
+    "by", "can", "did", "do", "does", "doing", "don", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just",
+    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
+    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
+    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
+    "why", "with", "you", "your", "yours", "yourself", "yourselves", "please", "can", "could",
+    "want", "need", "like", "using", "use", "make", "create", "build", "run", "do"
+}
+
+
+def tokenize(text: str) -> list[str]:
+    """Tokenize string into lowercase alphanumeric words with morphological stems."""
+    clean = re.findall(r"[a-zA-Z0-9_-]+", text.lower())
+    tokens = []
+    for word in clean:
+        w = word.strip("-_")
+        if len(w) >= 2 and w not in STOPWORDS:
+            tokens.append(w)
+            # Morphological stems
+            if w.endswith("tion") and len(w) > 5:
+                tokens.append(w[:-4])
+                tokens.append(w[:-4] + "te")
+            elif w.endswith("ies") and len(w) > 4:
+                tokens.append(w[:-3] + "y")
+            elif w.endswith("ing") and len(w) > 5:
+                tokens.append(w[:-3])
+            elif w.endswith("ed") and len(w) > 4:
+                tokens.append(w[:-2])
+            elif w.endswith("s") and len(w) > 3 and not w.endswith("ss"):
+                tokens.append(w[:-1])
+    return tokens
+
+
+@dataclass
+class MatchResult:
+    skill: ParsedSkill
+    score: float
+    confidence_pct: int
+    matched_terms: list[str]
+    matched_headings: list[str]
+    recommended_action: str
+    reasons: list[str]
+
+
+class SkillMatcher:
+    """Evaluates task queries against skills using weighted TF-IDF & structural signals."""
+
+    def __init__(self, skills: Sequence[ParsedSkill]):
+        self.skills = list(skills)
+        self._doc_count = len(self.skills)
+        self._doc_freq: dict[str, int] = {}
+        self._build_index()
+
+    def _build_index(self) -> None:
+        """Build term frequency and inverse document frequency index."""
+        term_docs: dict[str, set[str]] = {}
+        for skill in self.skills:
+            seen_terms: set[str] = set()
+            # Ingest name, tags, description, headings, body
+            text_corpus = f"{skill.meta.name} {' '.join(skill.meta.tags)} {skill.meta.description} " \
+                          f"{' '.join(s.title for s in skill.sections)} {skill.full_text[:5000]}"
+            for t in tokenize(text_corpus):
+                seen_terms.add(t)
+
+            for t in seen_terms:
+                term_docs.setdefault(t, set()).add(skill.meta.name)
+
+        for term, docs in term_docs.items():
+            self._doc_freq[term] = len(docs)
+
+    def _idf(self, term: str) -> float:
+        """Calculate inverse document frequency."""
+        df = self._doc_freq.get(term, 0)
+        return math.log(1.0 + (self._doc_count - df + 0.5) / (df + 0.5))
+
+    def match(self, query: str, limit: int = 5, min_score: float = 0.15) -> list[MatchResult]:
+        """Rank skills matching a natural language task description."""
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return []
+
+        results: list[MatchResult] = []
+
+        for skill in self.skills:
+            score = 0.0
+            matched_terms = set()
+            matched_headings = []
+            reasons = []
+
+            skill_name_lower = skill.meta.name.lower()
+            desc_tokens = set(tokenize(skill.meta.description))
+            name_tokens = set(tokenize(skill.meta.name))
+            tag_tokens = set(tokenize(" ".join(skill.meta.tags)))
+
+            # Check direct name match
+            if skill_name_lower in query.lower() or query.lower() in skill_name_lower:
+                score += 15.0
+                matched_terms.add(skill.meta.name)
+                reasons.append(f"exact name match '{skill.meta.name}'")
+
+            # Check heading matches
+            for sec in skill.sections:
+                sec_tokens = set(tokenize(sec.title))
+                overlap = sec_tokens.intersection(query_tokens)
+                if overlap:
+                    score += 4.0 * len(overlap)
+                    matched_headings.append(sec.title)
+                    matched_terms.update(overlap)
+
+            # Check token overlap in name, tags, description
+            for t in query_tokens:
+                idf = self._idf(t)
+                if t in name_tokens:
+                    score += 8.0 * idf
+                    matched_terms.add(t)
+                elif t in tag_tokens:
+                    score += 6.0 * idf
+                    matched_terms.add(t)
+                elif t in desc_tokens:
+                    score += 4.0 * idf
+                    matched_terms.add(t)
+                elif t in skill.full_text.lower():
+                    # Term frequency in body
+                    freq = min(skill.full_text.lower().count(t), 5)
+                    score += (0.8 * freq) * idf
+                    matched_terms.add(t)
+
+            if score <= 0.0:
+                continue
+
+            # Normalized confidence calculation
+            max_possible = max(1.0, len(query_tokens) * 12.0)
+            confidence = min(99, max(5, int((score / max_possible) * 100)))
+
+            if score >= min_score:
+                if matched_headings:
+                    best_sec = matched_headings[0]
+                    rec = f"skills-cli load {skill.meta.name} --section \"{best_sec}\""
+                elif skill.token_estimate > 2000:
+                    rec = f"skills-cli info {skill.meta.name} (or --summary)"
+                else:
+                    rec = f"skills-cli load {skill.meta.name}"
+
+                reasons_str = reasons or [f"matched: {', '.join(sorted(matched_terms)[:4])}"]
+
+                results.append(
+                    MatchResult(
+                        skill=skill,
+                        score=round(score, 2),
+                        confidence_pct=confidence,
+                        matched_terms=sorted(list(matched_terms)),
+                        matched_headings=matched_headings[:3],
+                        recommended_action=rec,
+                        reasons=reasons_str,
+                    )
+                )
+
+        # Sort descending by score
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:limit]
+
+# --- END MODULE: matcher.py ---
+
+
+# --- BEGIN MODULE: cache.py ---
+
+"""Persistent JSON cache for instant mtime-validated skill indexing."""
+
+
+import json
+from pathlib import Path
+from typing import Any
+
+
+CACHE_VERSION = 1
+
+
+def get_cache_dir() -> Path:
+    """Return user cache directory (~/.cache/skills-cli)."""
+    p = Path.home() / ".cache" / "skills-cli"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_cache_file() -> Path:
+    return get_cache_dir() / "index.json"
+
+
+def serialize_skill(skill: ParsedSkill) -> dict[str, Any]:
+    """Convert ParsedSkill to JSON-serializable dict."""
+    return {
+        "path": str(skill.path),
+        "mtime": skill.mtime,
+        "word_count": skill.word_count,
+        "token_estimate": skill.token_estimate,
+        "meta": {
+            "name": skill.meta.name,
+            "description": skill.meta.description,
+            "version": skill.meta.version,
+            "license": skill.meta.license,
+            "allowed_tools": skill.meta.allowed_tools,
+            "user_invocable": skill.meta.user_invocable,
+            "compatibility": skill.meta.compatibility,
+            "tags": skill.meta.tags,
+            "raw_frontmatter": skill.meta.raw_frontmatter,
+        },
+        "sections": [
+            {
+                "title": s.title,
+                "level": s.level,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+            }
+            for s in skill.sections
+        ],
+    }
+
+
+def deserialize_skill(data: dict[str, Any]) -> ParsedSkill:
+    """Reconstruct ParsedSkill from cached dict (body read lazily on load)."""
+    p = Path(data["path"])
+    meta_dict = data["meta"]
+    meta = SkillMeta(
+        name=meta_dict["name"],
+        description=meta_dict.get("description", ""),
+        version=meta_dict.get("version", ""),
+        license=meta_dict.get("license", ""),
+        allowed_tools=meta_dict.get("allowed_tools", ""),
+        user_invocable=meta_dict.get("user_invocable", True),
+        compatibility=meta_dict.get("compatibility", ""),
+        tags=meta_dict.get("tags", []),
+        raw_frontmatter=meta_dict.get("raw_frontmatter", {}),
+    )
+    sections = [
+        Section(
+            title=s["title"],
+            level=s["level"],
+            start_line=s["start_line"],
+            end_line=s["end_line"],
+        )
+        for s in data["sections"]
+    ]
+    return ParsedSkill(
+        path=p,
+        meta=meta,
+        sections=sections,
+        full_text="",  # Lazy loaded if needed
+        word_count=data["word_count"],
+        token_estimate=data["token_estimate"],
+        mtime=data["mtime"],
+    )
+
+
+def load_cached_skills(workspace_dir: Path | None = None, force_reindex: bool = False) -> list[ParsedSkill]:
+    """Load skills using cached index when valid, incrementally updating changed files."""
+    cache_path = get_cache_file()
+    cached_entries: dict[str, dict[str, Any]] = {}
+
+    if not force_reindex and cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            if raw.get("version") == CACHE_VERSION:
+                cached_entries = raw.get("skills", {})
+        except Exception:
+            cached_entries = {}
+
+    refs = scan_skills(workspace_dir)
+    skills: list[ParsedSkill] = []
+    dirty = False
+    current_paths: set[str] = set()
+
+    for ref in refs:
+        path_str = str(ref.path)
+        current_paths.add(path_str)
+        try:
+            curr_mtime = ref.path.stat().st_mtime
+        except OSError:
+            continue
+
+        cached = cached_entries.get(path_str)
+        if cached and abs(cached.get("mtime", 0) - curr_mtime) < 1e-4:
+            # Valid cache hit
+            skill = deserialize_skill(cached)
+            skills.append(skill)
+        else:
+            # Parse fresh
+            dirty = True
+            try:
+                skill = parse_skill_file(ref.path)
+                skills.append(skill)
+                cached_entries[path_str] = serialize_skill(skill)
+            except Exception:
+                continue
+
+    # Remove stale cache entries
+    stale = [p for p in cached_entries if p not in current_paths]
+    if stale:
+        dirty = True
+        for p in stale:
+            del cached_entries[p]
+
+    if dirty:
+        try:
+            payload = {
+                "version": CACHE_VERSION,
+                "timestamp": str(Path(cache_path).stat().st_mtime if cache_path.exists() else 0),
+                "skills": cached_entries,
+            }
+            cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    return skills
+
+# --- END MODULE: cache.py ---
+
+
+# --- BEGIN MODULE: cli.py ---
+
+"""Main CLI implementation for skills-cli."""
+
+
+import argparse
+import fnmatch
+import json
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+
+VERSION = "1.0.0"
+
+
+def format_tokens(n: int) -> str:
+    """Format token count with clean human-readable units."""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def cmd_list(skills: list, args: argparse.Namespace) -> int:
+    """List skills concisely with token estimates."""
+    if args.json:
+        out = [
+            {
+                "name": s.meta.name,
+                "description": s.meta.description,
+                "tokens": s.token_estimate,
+                "path": str(s.path),
+                "tags": s.meta.tags,
+            }
+            for s in skills
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"\nDiscovered {len(skills)} skills:")
+    for s in sorted(skills, key=lambda x: x.meta.name):
+        tok_str = f"~{format_tokens(s.token_estimate)} tok"
+        tags_str = f"[{', '.join(s.meta.tags)}]" if s.meta.tags else ""
+        print(f"  • {s.meta.name:<24} {tok_str:>9}   {tags_str}")
+        if args.with_descriptions and s.meta.description:
+            # Wrap description cleanly
+            clean_desc = " ".join(s.meta.description.split())
+            if len(clean_desc) > 90:
+                clean_desc = clean_desc[:87] + "..."
+            print(f"      {clean_desc}")
+
+    print("\nTip: Use 'skills-cli info <skill>' or 'skills-cli match \"<task>\"'\n")
+    return 0
+
+
+def cmd_info(skills: list, args: argparse.Namespace) -> int:
+    """Show detailed metadata and table of contents for a single skill."""
+    target = args.skill.strip().lower()
+    match = next((s for s in skills if s.meta.name.lower() == target), None)
+    if not match:
+        # Try substring
+        matches = [s for s in skills if target in s.meta.name.lower()]
+        if len(matches) == 1:
+            match = matches[0]
+        elif matches:
+            print(f"Ambiguous skill name '{args.skill}'. Did you mean one of:")
+            for m in matches:
+                print(f"  • {m.meta.name}")
+            return 1
+        else:
+            print(f"Error: Skill '{args.skill}' not found.")
+            return 1
+
+    if args.json:
+        out = {
+            "name": match.meta.name,
+            "description": match.meta.description,
+            "version": match.meta.version,
+            "license": match.meta.license,
+            "allowed_tools": match.meta.allowed_tools,
+            "tokens": match.token_estimate,
+            "words": match.word_count,
+            "path": str(match.path),
+            "tags": match.meta.tags,
+            "sections": [{"title": s.title, "level": s.level} for s in match.sections],
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"\nSkill: {match.meta.name}")
+    print(f"Path:  {match.path}")
+    print(f"Size:  ~{format_tokens(match.token_estimate)} tokens ({match.word_count:,} words)")
+    if match.meta.version:
+        print(f"Ver:   {match.meta.version}")
+    if match.meta.license:
+        print(f"Lic:   {match.meta.license}")
+    if match.meta.allowed_tools:
+        print(f"Tools: {match.meta.allowed_tools}")
+    if match.meta.tags:
+        print(f"Tags:  {', '.join(match.meta.tags)}")
+
+    if match.meta.description:
+        print(f"\nDescription:\n  {match.meta.description.strip()}")
+
+    if match.sections:
+        print("\nSections (TOC):")
+        for sec in match.sections:
+            indent = "  " * sec.level
+            print(f"{indent}- {sec.title}")
+            print(f"{indent}    -> skills-cli load {match.meta.name} --section \"{sec.title}\"")
+
+    print(f"\nFull load command:\n  skills-cli load {match.meta.name}\n")
+    return 0
+
+
+def cmd_grep(skills: list, args: argparse.Namespace) -> int:
+    """Filter skills using glob pattern on name, tags, or path."""
+    pat = args.pattern.strip().lower()
+    matched = []
+    for s in skills:
+        haystack = f"{s.meta.name} {' '.join(s.meta.tags)} {s.path}".lower()
+        if fnmatch.fnmatch(s.meta.name.lower(), pat) or fnmatch.fnmatch(haystack, pat) or pat in s.meta.name.lower():
+            matched.append(s)
+
+    if args.json:
+        print(json.dumps([s.meta.name for s in matched], indent=2))
+        return 0
+
+    if not matched:
+        print(f"No skills matched pattern: '{args.pattern}'")
+        return 1
+
+    print(f"\nMatched {len(matched)} skills for pattern '{args.pattern}':")
+    for s in matched:
+        tok_str = f"~{format_tokens(s.token_estimate)} tok"
+        print(f"  • {s.meta.name:<24} {tok_str:>9}")
+        if args.with_descriptions and s.meta.description:
+            print(f"      {s.meta.description[:90]}...")
+    print()
+    return 0
+
+
+def cmd_search(skills: list, args: argparse.Namespace) -> int:
+    """Full-text keyword search across skills."""
+    matcher = SkillMatcher(skills)
+    results = matcher.match(args.query, limit=args.limit, min_score=0.1)
+
+    if args.json:
+        out = [
+            {
+                "skill": r.skill.meta.name,
+                "score": r.score,
+                "confidence": r.confidence_pct,
+                "matched_terms": r.matched_terms,
+                "path": str(r.skill.path),
+            }
+            for r in results
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if not results:
+        print(f"No skills found matching search: '{args.query}'")
+        return 1
+
+    print(f"\nSearch results for '{args.query}':")
+    for r in results:
+        tok_str = f"~{format_tokens(r.skill.token_estimate)} tok"
+        print(f"  • {r.skill.meta.name:<22} [{r.confidence_pct}% match] {tok_str:>9}")
+        if r.matched_terms:
+            print(f"      Terms: {', '.join(r.matched_terms[:6])}")
+        if r.skill.meta.description:
+            print(f"      {r.skill.meta.description[:85]}...")
+    print()
+    return 0
+
+
+def cmd_match(skills: list, args: argparse.Namespace) -> int:
+    """AI task router: evaluate task prompt and recommend top relevant skills."""
+    matcher = SkillMatcher(skills)
+    results = matcher.match(args.task, limit=args.limit, min_score=0.2)
+
+    if args.json:
+        out = [
+            {
+                "skill": r.skill.meta.name,
+                "confidence": r.confidence_pct,
+                "score": r.score,
+                "tokens": r.skill.token_estimate,
+                "matched_terms": r.matched_terms,
+                "matched_headings": r.matched_headings,
+                "recommended_action": r.recommended_action,
+                "description": r.skill.meta.description,
+            }
+            for r in results
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if not results:
+        print(f"\nNo matching specialized skill found for task:")
+        print(f"  \"{args.task}\"")
+        print("Recommendation: Proceed with standard instructions or inspect with 'skills-cli'\n")
+        return 0
+
+    print(f"\nTask Match Results for:")
+    print(f"  \"{args.task}\"\n")
+
+    for idx, r in enumerate(results, 1):
+        tok_str = f"~{format_tokens(r.skill.token_estimate)} tokens"
+        print(f"{idx}. {r.skill.meta.name} [Confidence: {r.confidence_pct}%] ({tok_str})")
+        if r.skill.meta.description:
+            desc = " ".join(r.skill.meta.description.split())
+            if len(desc) > 110:
+                desc = desc[:107] + "..."
+            print(f"   Desc:   {desc}")
+        if r.matched_terms:
+            print(f"   Match:  {', '.join(r.matched_terms[:6])}")
+        if r.matched_headings:
+            print(f"   Focus:  {', '.join(r.matched_headings[:2])}")
+        print(f"   Action: {r.recommended_action}")
+        print()
+
+    return 0
+
+
+def cmd_load(skills: list, args: argparse.Namespace) -> int:
+    """Load skill instructions (full, section, or summary) directly into stdout."""
+    target = args.skill.strip().lower()
+    match = next((s for s in skills if s.meta.name.lower() == target), None)
+    if not match:
+        matches = [s for s in skills if target in s.meta.name.lower()]
+        if len(matches) == 1:
+            match = matches[0]
+        elif matches:
+            print(f"Error: Ambiguous skill '{args.skill}'. Options: {', '.join(m.meta.name for m in matches)}", file=sys.stderr)
+            return 1
+        else:
+            print(f"Error: Skill '{args.skill}' not found.", file=sys.stderr)
+            return 1
+
+    # Ensure full text is loaded
+    parsed = parse_skill_file(match.path)
+
+    # 1. Summary mode
+    if args.summary:
+        print(f"# Skill: {parsed.meta.name}")
+        if parsed.meta.description:
+            print(f"\n{parsed.meta.description}\n")
+        print("## Available Sections:")
+        for sec in parsed.sections:
+            print(f"  {'  ' * (sec.level - 1)}- {sec.title}")
+        print(f"\nTo load a section: skills-cli load {parsed.meta.name} --section \"<title>\"")
+        return 0
+
+    # 2. Section extraction
+    if args.section:
+        sec = extract_section(parsed, args.section)
+        if not sec:
+            print(f"Error: Section '{args.section}' not found in skill '{parsed.meta.name}'.", file=sys.stderr)
+            print("Available sections:", file=sys.stderr)
+            for s in parsed.sections:
+                print(f"  - {s.title}", file=sys.stderr)
+            return 1
+
+        sec_tokens = int(len(sec.content.split()) * 1.33)
+        if not args.plain:
+            print(f"<!-- Loaded section '{sec.title}' from {parsed.meta.name} (~{sec_tokens} tokens) -->\n")
+        print(sec.content)
+        return 0
+
+    # 3. Full text with token budget
+    content = parsed.full_text
+    if args.max_tokens and parsed.token_estimate > args.max_tokens:
+        words = content.split()
+        max_words = int(args.max_tokens / 1.33)
+        truncated = " ".join(words[:max_words])
+        if not args.plain:
+            print(f"<!-- Truncated to ~{args.max_tokens} tokens (original was ~{parsed.token_estimate} tokens) -->\n")
+        print(truncated)
+        print("\n\n... [Truncated due to --max-tokens budget. Use --section to read specific parts]")
+        return 0
+
+    if not args.plain:
+        print(f"<!-- Loaded skill: {parsed.meta.name} (~{parsed.token_estimate} tokens) -->\n")
+    print(content)
+    return 0
+
+
+def cmd_stats(skills: list, args: argparse.Namespace) -> int:
+    """Output analytics and token impact of dynamic skill loading."""
+    total_skills = len(skills)
+    total_tokens = sum(s.token_estimate for s in skills)
+    total_words = sum(s.word_count for s in skills)
+    avg_tokens = total_tokens // max(1, total_skills)
+
+    if args.json:
+        print(json.dumps({
+            "total_skills": total_skills,
+            "total_tokens": total_tokens,
+            "total_words": total_words,
+            "average_tokens_per_skill": avg_tokens,
+        }, indent=2))
+        return 0
+
+    print("\nskills-cli Token & Context Analytics:")
+    print("=" * 45)
+    print(f"  Total Indexed Skills:        {total_skills:,}")
+    print(f"  Total Skill Content Size:    {total_tokens:,} tokens ({total_words:,} words)")
+    print(f"  Average Skill Size:          ~{avg_tokens:,} tokens")
+    print("-" * 45)
+    print(f"  Tokens Saved per Turn:       ~{total_tokens:,} tokens")
+    print("  Mechanism:                   On-Demand Dynamic Loading (via skills-cli)")
+    print("=" * 45 + "\n")
+    return 0
+
+
+def get_skill_tier(path: Path) -> tuple[str, str]:
+    """Classify skill into Hybrid Tier based on resolved file path."""
+    p_str = str(path.resolve())
+    home_str = str(Path.home())
+    if f"{home_str}/.config/skills" in p_str:
+        return ("Tier B", "On-Demand Library (0 prompt overhead)")
+    elif (
+        f"{home_str}/.gemini/config/skills" in p_str
+        or f"{home_str}/.gemini/antigravity/skills" in p_str
+        or f"{home_str}/.agents/skills" in p_str
+    ):
+        return ("Tier A", "Active in Prompt (<skills> block)")
+    elif "/builtin/skills" in p_str:
+        return ("Built-in", "Antigravity Product Shipped")
+    elif "/plugins/" in p_str:
+        return ("Plugin", "Bundled with Installed Plugin")
+    else:
+        return ("Workspace", "Project Workspace")
+
+
+def cmd_tiers(skills: list, args: argparse.Namespace) -> int:
+    """List skills grouped by their Hybrid Tier (Tier A: Prompt vs Tier B: Library)."""
+    groups: dict[str, list] = {
+        "Tier A (Active in Prompt)": [],
+        "Tier B (On-Demand Library)": [],
+        "Plugins & Built-ins": [],
+    }
+    for s in skills:
+        tier, _ = get_skill_tier(s.path)
+        if tier == "Tier A":
+            groups["Tier A (Active in Prompt)"].append(s)
+        elif tier == "Tier B":
+            groups["Tier B (On-Demand Library)"].append(s)
+        else:
+            groups["Plugins & Built-ins"].append(s)
+
+    if args.json:
+        out = {}
+        for gname, slist in groups.items():
+            out[gname] = [
+                {"name": s.meta.name, "tokens": s.token_estimate, "path": str(s.path)}
+                for s in slist
+            ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print("\nskills-cli Hybrid Tier Status:")
+    print("=" * 60)
+
+    for gname, slist in groups.items():
+        tot_tok = sum(s.token_estimate for s in slist)
+        print(f"\n{gname} ({len(slist)} skills, ~{format_tokens(tot_tok)} tokens):")
+        if not slist:
+            print("  (none)")
+            continue
+        for s in sorted(slist, key=lambda x: x.meta.name):
+            tok_str = f"~{format_tokens(s.token_estimate)} tok"
+            print(f"  • {s.meta.name:<22} {tok_str:>9}")
+
+    print("\n" + "=" * 60)
+    print("Management: Use 'skills-cli pin <skill>' or 'skills-cli unpin <skill>'\n")
+    return 0
+
+
+def cmd_pin(skills: list, args: argparse.Namespace) -> int:
+    """Pin a skill to Tier A (~/.gemini/config/skills) so it is active in prompt."""
+    import shutil
+
+    target_name = args.skill.strip().lower()
+    skill = next((s for s in skills if s.meta.name.lower() == target_name), None)
+    if not skill:
+        print(f"Error: Skill '{args.skill}' not found.", file=sys.stderr)
+        return 1
+
+    tier, _ = get_skill_tier(skill.path)
+    if tier == "Tier A":
+        print(f"Skill '{skill.meta.name}' is already in Tier A (active in prompt).")
+        return 0
+
+    dest_root = Path.home() / ".gemini" / "config" / "skills"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    dest_dir = dest_root / skill.meta.name
+
+    if skill.path.parent == dest_dir:
+        print(f"Skill '{skill.meta.name}' is already at {dest_dir}")
+        return 0
+
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(skill.path.parent, dest_dir)
+    print(f"Pinned '{skill.meta.name}' to Tier A: {dest_dir}")
+    print("Rebuilding cache...")
+    load_cached_skills(force_reindex=True)
+    return 0
+
+
+def cmd_unpin(skills: list, args: argparse.Namespace) -> int:
+    """Unpin a skill from Tier A to Tier B (~/.config/skills) for on-demand use."""
+    import shutil
+
+    target_name = args.skill.strip().lower()
+    skill = next((s for s in skills if s.meta.name.lower() == target_name), None)
+    if not skill:
+        print(f"Error: Skill '{args.skill}' not found.", file=sys.stderr)
+        return 1
+
+    tier, _ = get_skill_tier(skill.path)
+    if tier == "Tier B":
+        print(f"Skill '{skill.meta.name}' is already in Tier B (on-demand library).")
+        return 0
+    if tier in ("Built-in", "Plugin"):
+        print(f"Cannot unpin {tier} skill '{skill.meta.name}'.", file=sys.stderr)
+        return 1
+
+    lib_root = Path.home() / ".config" / "skills"
+    lib_root.mkdir(parents=True, exist_ok=True)
+    lib_dir = lib_root / skill.meta.name
+
+    # Copy to library first
+    if lib_dir.exists():
+        shutil.rmtree(lib_dir)
+    shutil.copytree(skill.path.parent, lib_dir)
+
+    # Remove from global config
+    if skill.path.parent.exists() and (Path.home() / ".gemini" / "config" / "skills" in skill.path.parents):
+        shutil.rmtree(skill.path.parent)
+
+    print(f"Unpinned '{skill.meta.name}' to Tier B: {lib_dir}")
+    print(f"Prompt overhead reduced: {skill.meta.name} will not be injected into system prompt.")
+    print("Rebuilding cache...")
+    load_cached_skills(force_reindex=True)
+    return 0
+
+
+def cmd_sync(skills: list, args: argparse.Namespace) -> int:
+    """Force re-index all skills and update cache."""
+    cache_file = get_cache_file()
+    fresh = load_cached_skills(force_reindex=True)
+    print(f"Successfully reindexed {len(fresh)} skills.")
+    print(f"Cache updated at: {cache_file}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="skills-cli",
+        description="skills-cli: Token-efficient dynamic skill discovery & on-demand context loading for AI agents.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"skills-cli v{VERSION}")
+    parser.add_argument("-d", "--with-descriptions", action="store_true", help="Include full descriptions in listings")
+    parser.add_argument("-j", "--json", action="store_true", help="Output results in JSON format")
+    parser.add_argument("-w", "--workspace", type=Path, default=None, help="Custom workspace directory to scan")
+
+    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+    # list
+    p_list = subparsers.add_parser("list", help="List all discovered skills")
+    p_list.set_defaults(func=cmd_list)
+
+    # info
+    p_info = subparsers.add_parser("info", help="Show skill metadata, TOC, and stats")
+    p_info.add_argument("skill", help="Name of skill to inspect")
+    p_info.set_defaults(func=cmd_info)
+
+    # grep
+    p_grep = subparsers.add_parser("grep", help="Search skills by pattern/glob")
+    p_grep.add_argument("pattern", help="Glob pattern or substring (e.g., '*design*')")
+    p_grep.set_defaults(func=cmd_grep)
+
+    # search
+    p_search = subparsers.add_parser("search", help="Full-text keyword search across skills")
+    p_search.add_argument("query", help="Search text query")
+    p_search.add_argument("-l", "--limit", type=int, default=10, help="Max results (default: 10)")
+    p_search.set_defaults(func=cmd_search)
+
+    # match
+    p_match = subparsers.add_parser("match", help="Smart AI task router: recommend skills for a task")
+    p_match.add_argument("task", help="Task description or user prompt")
+    p_match.add_argument("-l", "--limit", type=int, default=4, help="Max recommendations (default: 4)")
+    p_match.set_defaults(func=cmd_match)
+
+    # load / read
+    p_load = subparsers.add_parser("load", aliases=["read"], help="Load skill instructions into stdout")
+    p_load.add_argument("skill", help="Name of skill to load")
+    p_load.add_argument("-s", "--section", help="Extract only the specified section/heading")
+    p_load.add_argument("--summary", action="store_true", help="Output frontmatter + TOC outline only")
+    p_load.add_argument("--max-tokens", type=int, default=None, help="Truncate content to max token budget")
+    p_load.add_argument("--plain", action="store_true", help="Output raw text without header comments")
+    p_load.set_defaults(func=cmd_load)
+
+    # stats
+    p_stats = subparsers.add_parser("stats", aliases=["gain"], help="Show token analytics & context savings")
+    p_stats.set_defaults(func=cmd_stats)
+
+    # tiers / status
+    p_tiers = subparsers.add_parser("tiers", aliases=["status"], help="List skills by Hybrid Tier (Tier A: Prompt vs Tier B: On-Demand)")
+    p_tiers.set_defaults(func=cmd_tiers)
+
+    # pin
+    p_pin = subparsers.add_parser("pin", help="Promote a skill to Tier A (~/.gemini/config/skills) to activate in prompt")
+    p_pin.add_argument("skill", help="Name of skill to pin")
+    p_pin.set_defaults(func=cmd_pin)
+
+    # unpin
+    p_unpin = subparsers.add_parser("unpin", help="Demote a skill to Tier B (~/.config/skills) for on-demand use only")
+    p_unpin.add_argument("skill", help="Name of skill to unpin")
+    p_unpin.set_defaults(func=cmd_unpin)
+
+    # sync
+    p_sync = subparsers.add_parser("sync", help="Force cache rebuild")
+    p_sync.set_defaults(func=cmd_sync)
+
+    args = parser.parse_args(argv)
+
+    skills = load_cached_skills(workspace_dir=args.workspace)
+
+    if not args.command:
+        # Default behavior: list skills
+        return cmd_list(skills, args)
+
+    if hasattr(args, "func"):
+        return args.func(skills, args)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# --- END MODULE: cli.py ---

@@ -1,0 +1,11 @@
+{
+  "name": "skills-cli",
+  "displayName": "Skills CLI",
+  "version": "1.0.0",
+  "description": "On-demand dynamic skill discovery and context loading to keep irrelevant skills out of the model context window.",
+  "suggestedPrompts": [
+    "Find skills related to banner design and social media",
+    "Show token footprint and savings of installed skills",
+    "Match my current task to available skills"
+  ]
+}
