@@ -206,4 +206,4 @@ This merges all modules into `bin/skills-cli` while stripping relative imports, 
 ---
 
 ## 📄 License
-MIT License. Free to share, modify, and distribute with your team and friends!
+Apache 2.0 License.
